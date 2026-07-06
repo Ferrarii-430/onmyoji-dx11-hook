@@ -6,8 +6,35 @@
 #include <wincodec.h>
 #include <cstdio>
 #include <cstdarg>
+#include <cstdint>
 #include <string>
 #include <vector>
+
+// ============================================================================
+// 共享内存协议：DLL 把最新一帧的原始像素(BGRA, top-down, 紧密排列)写入命名
+// file mapping，script 进程可直接映射读取，无需 PNG 落盘/解码中转。
+// 该结构体布局必须与 script 侧 (Dx11CaptureShared.h) 保持完全一致。
+// ============================================================================
+static const wchar_t* kDx11SharedName = L"OnmyojiDx11CaptureShared";
+static const uint32_t kDx11SharedMagic = 0x31315844; // 'DX11'
+static const uint32_t kDx11SharedVersion = 1;
+// 支持的最大分辨率（用于预留共享内存大小），4K 足够覆盖桌面版窗口。
+static const uint32_t kDx11SharedMaxW = 3840;
+static const uint32_t kDx11SharedMaxH = 2160;
+
+#pragma pack(push, 4)
+struct Dx11CaptureShared {
+    uint32_t magic;     // kDx11SharedMagic
+    uint32_t version;   // kDx11SharedVersion
+    uint32_t sequence;  // 每次成功写入自增（读端可用于判断是否有新帧）
+    uint32_t status;    // 0 = 成功，非 0 = 无有效数据
+    uint32_t width;
+    uint32_t height;
+    uint32_t channels;  // 固定为 4 (BGRA)
+    uint32_t dataSize;  // = width * height * 4
+    // 紧随其后是像素数据（BGRA, top-down, 每行 width*4 字节，无 padding）
+};
+#pragma pack(pop)
 
 #include "MinHook.h"
 
@@ -39,8 +66,13 @@ static bool g_deviceCsInited = false;
 // 概率性导致显卡驱动崩溃/TDR 失败，从而出现全屏花屏、需要重启的严重问题。
 static std::atomic<bool> g_captureRequested{ false };
 static std::wstring g_capturePath;      // 受 g_deviceCs 保护
+static std::atomic<bool> g_capturePersist{ true }; // 是否额外把截图持久化为 PNG
 static std::atomic<int> g_captureResult{ 0 };
 static HANDLE g_captureDoneEvent = nullptr; // 手动重置事件
+
+// 共享内存句柄（在渲染线程首次截图时创建，受 g_deviceCs 保护）
+static HANDLE g_sharedMapping = nullptr;
+static void* g_sharedView = nullptr;
 
 
 // 线程安全的日志系统初始化
@@ -148,6 +180,15 @@ extern "C" __declspec(dllexport) DWORD StopHookAndCleanup() {
         g_device = nullptr;
         Log(L"g_device 已释放");
     }
+    if (g_sharedView) {
+        UnmapViewOfFile(g_sharedView);
+        g_sharedView = nullptr;
+    }
+    if (g_sharedMapping) {
+        CloseHandle(g_sharedMapping);
+        g_sharedMapping = nullptr;
+        Log(L"共享内存已释放");
+    }
     if (g_deviceCsInited) LeaveCriticalSection(&g_deviceCs);
 
     // 3. 卸载MinHook
@@ -223,6 +264,103 @@ extern "C" __declspec(dllexport) void SetLogPath(const wchar_t* path) {
 
     // 使用副本记录日志，避免竞争条件
     Log(L"日志路径设置为: %s", logPathToLog.empty() ? L"<TEMP>" : logPathToLog.c_str());
+}
+
+// 确保命名共享内存已创建（仅在渲染线程、持有 g_deviceCs 时调用）。
+static bool EnsureSharedMemory() {
+    if (g_sharedView) return true;
+
+    const size_t total = sizeof(Dx11CaptureShared) +
+        (size_t)kDx11SharedMaxW * kDx11SharedMaxH * 4;
+
+    g_sharedMapping = CreateFileMappingW(
+        INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE,
+        (DWORD)(total >> 32), (DWORD)(total & 0xFFFFFFFF), kDx11SharedName);
+    if (!g_sharedMapping) {
+        Log(L"CreateFileMapping 失败: %lu", GetLastError());
+        return false;
+    }
+
+    g_sharedView = MapViewOfFile(g_sharedMapping, FILE_MAP_WRITE, 0, 0, total);
+    if (!g_sharedView) {
+        Log(L"MapViewOfFile 失败: %lu", GetLastError());
+        CloseHandle(g_sharedMapping);
+        g_sharedMapping = nullptr;
+        return false;
+    }
+
+    // 初始化头部：暂无有效数据
+    Dx11CaptureShared* hdr = (Dx11CaptureShared*)g_sharedView;
+    hdr->magic = kDx11SharedMagic;
+    hdr->version = kDx11SharedVersion;
+    hdr->sequence = 0;
+    hdr->status = 1;
+    hdr->width = hdr->height = hdr->channels = hdr->dataSize = 0;
+
+    Log(L"共享内存已创建: %s (容量=%llu 字节)", kDx11SharedName, (unsigned long long)total);
+    return true;
+}
+
+// 把后备缓冲区的原始 BGRA 像素写入共享内存，供 script 进程直接读取。
+// 仅在渲染线程调用（复用 immediate context 是安全的）。
+static bool SaveTextureToSharedMemory(ID3D11Texture2D* src) {
+    if (!src || !g_device || !g_context) return false;
+
+    D3D11_TEXTURE2D_DESC desc;
+    src->GetDesc(&desc);
+    if (desc.Width == 0 || desc.Height == 0) return false;
+    if (desc.Width > kDx11SharedMaxW || desc.Height > kDx11SharedMaxH) {
+        Log(L"共享内存: 分辨率 %ux%u 超过上限 %ux%u", desc.Width, desc.Height,
+            kDx11SharedMaxW, kDx11SharedMaxH);
+        return false;
+    }
+
+    if (!EnsureSharedMemory()) return false;
+
+    D3D11_TEXTURE2D_DESC staging = desc;
+    staging.Usage = D3D11_USAGE_STAGING;
+    staging.BindFlags = 0;
+    staging.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    staging.MiscFlags = 0;
+
+    ComPtr<ID3D11Texture2D> copy;
+    HRESULT hr = g_device->CreateTexture2D(&staging, nullptr, &copy);
+    if (FAILED(hr)) {
+        Log(L"共享内存: CreateTexture2D staging 失败: 0x%08x", hr);
+        return false;
+    }
+
+    g_context->CopyResource(copy.Get(), src);
+
+    D3D11_MAPPED_SUBRESOURCE mapped;
+    hr = g_context->Map(copy.Get(), 0, D3D11_MAP_READ, 0, &mapped);
+    if (FAILED(hr)) {
+        Log(L"共享内存: Map 失败: 0x%08x", hr);
+        return false;
+    }
+
+    Dx11CaptureShared* hdr = (Dx11CaptureShared*)g_sharedView;
+    BYTE* dst = (BYTE*)g_sharedView + sizeof(Dx11CaptureShared);
+    const UINT rowBytes = desc.Width * 4;
+
+    // 逐行拷贝，去除 RowPitch 的行内 padding，得到紧密排列的 BGRA 数据。
+    for (UINT y = 0; y < desc.Height; y++) {
+        memcpy(dst + (size_t)y * rowBytes,
+               (BYTE*)mapped.pData + (size_t)y * mapped.RowPitch, rowBytes);
+    }
+
+    g_context->Unmap(copy.Get(), 0);
+
+    // 先写数据再更新头部，最后自增 sequence 作为“可用”标记。
+    hdr->status = 0;
+    hdr->width = desc.Width;
+    hdr->height = desc.Height;
+    hdr->channels = 4;
+    hdr->dataSize = rowBytes * desc.Height;
+    hdr->sequence += 1;
+
+    Log(L"已写入共享内存 (宽x高=%u x %u, seq=%u)", desc.Width, desc.Height, hdr->sequence);
+    return true;
 }
 
 static bool SaveTextureToPngWithManualSwap(ID3D11Texture2D* src, const std::wstring& path) {
@@ -410,13 +548,19 @@ extern "C" __declspec(dllexport) DWORD CaptureFrame(const wchar_t* savePath) {
         return 0;
     }
 
+    // 持久化开关：script 侧若不需要 PNG 落盘，会把路径参数传为空或哨兵
+    // "__NO_FILE__"。此时只写共享内存，不写文件。
+    std::wstring incoming = savePath;
+    bool persist = !(incoming.empty() || incoming == L"__NO_FILE__");
+
     // 关键修复：不在本(远程)线程直接使用 D3D immediate context。
     // 将请求投递给渲染线程 (hkPresent) 执行，然后在此等待结果。
     // 这样所有对 immediate context 的访问都发生在同一个(渲染)线程上，
     // 避免与游戏渲染竞争导致 GPU 命令流损坏、驱动崩溃与全屏花屏。
     EnterCriticalSection(&g_deviceCs);
-    g_capturePath = savePath;
+    g_capturePath = persist ? incoming : std::wstring();
     LeaveCriticalSection(&g_deviceCs);
+    g_capturePersist.store(persist);
 
     ResetEvent(g_captureDoneEvent);
     g_captureResult.store(0);
@@ -490,15 +634,24 @@ HRESULT STDMETHODCALLTYPE hkPresent(IDXGISwapChain* pSwapChain, UINT SyncInterva
         EnterCriticalSection(&g_deviceCs);
         path = g_capturePath;
         LeaveCriticalSection(&g_deviceCs);
+        bool persist = g_capturePersist.load();
 
         int result = 0;
-        if (!path.empty() && pSwapChain == g_swap.load()) {
+        if (pSwapChain == g_swap.load()) {
             EnterCriticalSection(&g_deviceCs);
             if (g_device && g_context) {
                 ComPtr<ID3D11Texture2D> back;
                 HRESULT hr = pSwapChain->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)&back);
                 if (SUCCEEDED(hr) && back) {
-                    result = SaveTextureToPngWithManualSwap(back.Get(), path) ? 1 : 0;
+                    // 主路径：把原始像素写入共享内存供 script 直接读取。
+                    bool sharedOk = SaveTextureToSharedMemory(back.Get());
+                    // 可选：按开关额外持久化为 PNG。
+                    if (persist && !path.empty()) {
+                        if (!SaveTextureToPngWithManualSwap(back.Get(), path)) {
+                            Log(L"PNG 持久化失败: %s", path.c_str());
+                        }
+                    }
+                    result = sharedOk ? 1 : 0;
                 } else {
                     Log(L"GetBuffer 失败: 0x%08x", hr);
                 }
