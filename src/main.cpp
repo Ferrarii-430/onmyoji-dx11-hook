@@ -28,6 +28,20 @@ static std::atomic<bool> g_cleanupInProgress{false};
 static HMODULE g_hModule = nullptr;
 static bool g_selfUnloading = false;
 
+// 保护对 D3D11 immediate context / device 的访问。
+// ID3D11DeviceContext 的 immediate context 不是线程安全的，游戏渲染线程会持续
+// 在该 context 上渲染，因此绝不能在其它线程直接使用它。
+static CRITICAL_SECTION g_deviceCs;
+static bool g_deviceCsInited = false;
+
+// 截图请求：CaptureFrame 在远程线程被调用，但真正的 D3D 操作必须放到渲染线程
+// (hkPresent) 中执行，否则跨线程使用 immediate context 会损坏 GPU 命令流，
+// 概率性导致显卡驱动崩溃/TDR 失败，从而出现全屏花屏、需要重启的严重问题。
+static std::atomic<bool> g_captureRequested{ false };
+static std::wstring g_capturePath;      // 受 g_deviceCs 保护
+static std::atomic<int> g_captureResult{ 0 };
+static HANDLE g_captureDoneEvent = nullptr; // 手动重置事件
+
 
 // 线程安全的日志系统初始化
 static void InitLogSystem() {
@@ -104,6 +118,13 @@ extern "C" __declspec(dllexport) DWORD StopHookAndCleanup() {
 
     Sleep(100);
 
+    // 唤醒任何正在等待截图完成的远程线程，避免其一直阻塞。
+    g_captureRequested.store(false);
+    if (g_captureDoneEvent) {
+        g_captureResult.store(0);
+        SetEvent(g_captureDoneEvent);
+    }
+
     // 安全清理D3D资源
     IDXGISwapChain* oldSwap = g_swap.exchange(nullptr);
     if (oldSwap) {
@@ -112,24 +133,22 @@ extern "C" __declspec(dllexport) DWORD StopHookAndCleanup() {
 
     g_initialized.store(false);
 
+    // 不在此(远程)线程上对 immediate context 提交任何命令(如 ClearState/Flush)，
+    // 因为那会与游戏渲染线程竞争同一个 context。这里只做引用计数释放
+    // (Release 内部是线程安全的原子操作)，并用临界区确保不会与渲染线程中
+    // 正在进行的截图操作重叠。
+    if (g_deviceCsInited) EnterCriticalSection(&g_deviceCs);
     if (g_context) {
-        try {
-            g_context->ClearState();
-            g_context->Flush();
-            Log(L"上下文状态已清除并刷新");
-        } catch (...) {
-            Log(L"在上下文 ClearState/Flush 中发生异常");
-        }
         g_context->Release();
         g_context = nullptr;
         Log(L"g_context 已释放");
     }
-
     if (g_device) {
         g_device->Release();
         g_device = nullptr;
         Log(L"g_device 已释放");
     }
+    if (g_deviceCsInited) LeaveCriticalSection(&g_deviceCs);
 
     // 3. 卸载MinHook
     Log(L"正在取消初始化 MinHook");
@@ -143,6 +162,16 @@ extern "C" __declspec(dllexport) DWORD StopHookAndCleanup() {
     // 4. 清理日志系统
     Log(L"正在清理日志系统");
     Log(L"StopHookAndCleanup 完成成功");
+
+    if (g_captureDoneEvent) {
+        CloseHandle(g_captureDoneEvent);
+        g_captureDoneEvent = nullptr;
+    }
+
+    if (g_deviceCsInited) {
+        DeleteCriticalSection(&g_deviceCs);
+        g_deviceCsInited = false;
+    }
 
     if (g_logInited) {
         DeleteCriticalSection(&g_logCs);
@@ -376,24 +405,35 @@ extern "C" __declspec(dllexport) DWORD CaptureFrame(const wchar_t* savePath) {
         return 0;
     }
 
-    // 单次尝试，避免重试造成的性能问题
-    IDXGISwapChain* sc = g_swap.load();
-    if (!sc) {
-        Log(L"无可用交换链 (g_swap==null)");
+    if (!g_captureDoneEvent) {
+        Log(L"截图事件未创建，无法请求截图");
         return 0;
     }
 
-    ComPtr<ID3D11Texture2D> back;
-    HRESULT hr = sc->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)&back);
+    // 关键修复：不在本(远程)线程直接使用 D3D immediate context。
+    // 将请求投递给渲染线程 (hkPresent) 执行，然后在此等待结果。
+    // 这样所有对 immediate context 的访问都发生在同一个(渲染)线程上，
+    // 避免与游戏渲染竞争导致 GPU 命令流损坏、驱动崩溃与全屏花屏。
+    EnterCriticalSection(&g_deviceCs);
+    g_capturePath = savePath;
+    LeaveCriticalSection(&g_deviceCs);
 
-    if (SUCCEEDED(hr) && back) {
-        bool ok = SaveTextureToPngWithManualSwap(back.Get(), savePath);
-        Log(L"CaptureFrame 结果=%d", ok ? 1 : 0);
-        return ok ? 1 : 0;
-    } else {
-        Log(L"GetBuffer 失败: 0x%08x", hr);
+    ResetEvent(g_captureDoneEvent);
+    g_captureResult.store(0);
+    g_captureRequested.store(true);
+
+    // 等待渲染线程完成截图。Present 通常每秒调用数十次，2 秒超时足够宽松；
+    // 若游戏长时间不出帧则超时返回失败，绝不阻塞卸载。
+    DWORD wr = WaitForSingleObject(g_captureDoneEvent, 2000);
+    if (wr != WAIT_OBJECT_0) {
+        g_captureRequested.store(false); // 撤销未被处理的请求
+        Log(L"CaptureFrame 等待渲染线程超时 (wr=%lu)", wr);
         return 0;
     }
+
+    int r = g_captureResult.load();
+    Log(L"CaptureFrame 结果=%d", r);
+    return r;
 }
 
 // Present hook implementation
@@ -440,6 +480,35 @@ HRESULT STDMETHODCALLTYPE hkPresent(IDXGISwapChain* pSwapChain, UINT SyncInterva
             }
             initializing.store(false);
         }
+    }
+
+    // 在渲染线程上处理待执行的截图请求。此时后备缓冲区已渲染完成、尚未 Present，
+    // 且所有 D3D 操作都在拥有 context 的渲染线程上进行，从根本上避免了跨线程使用
+    // immediate context 造成的 GPU 命令流损坏(花屏)。
+    if (g_initialized.load() && g_captureRequested.load()) {
+        std::wstring path;
+        EnterCriticalSection(&g_deviceCs);
+        path = g_capturePath;
+        LeaveCriticalSection(&g_deviceCs);
+
+        int result = 0;
+        if (!path.empty() && pSwapChain == g_swap.load()) {
+            EnterCriticalSection(&g_deviceCs);
+            if (g_device && g_context) {
+                ComPtr<ID3D11Texture2D> back;
+                HRESULT hr = pSwapChain->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)&back);
+                if (SUCCEEDED(hr) && back) {
+                    result = SaveTextureToPngWithManualSwap(back.Get(), path) ? 1 : 0;
+                } else {
+                    Log(L"GetBuffer 失败: 0x%08x", hr);
+                }
+            }
+            LeaveCriticalSection(&g_deviceCs);
+        }
+
+        g_captureResult.store(result);
+        g_captureRequested.store(false);
+        if (g_captureDoneEvent) SetEvent(g_captureDoneEvent);
     }
 
     // 调用原始函数
@@ -502,7 +571,7 @@ static bool HookPresent() {
 DWORD WINAPI InitThread(LPVOID) {
     g_hookThread = GetCurrentThread(); // 保存当前线程句柄
 
-    InitializeCriticalSection(&g_logCs);
+    // g_logCs 已在 DllMain 中经 InitLogSystem 初始化，切勿重复 InitializeCriticalSection。
     Log(L"DLL 已附加，启动钩子线程");
 
     // 检查是否已经被要求停止
@@ -526,6 +595,17 @@ BOOL WINAPI DllMain(HMODULE hModule, DWORD reason, LPVOID) {
         g_selfUnloading = false;
 
         InitLogSystem();
+
+        // 初始化保护 D3D context 的临界区与截图完成事件（手动重置）。
+        if (!g_deviceCsInited) {
+            InitializeCriticalSection(&g_deviceCs);
+            g_deviceCsInited = true;
+        }
+        if (!g_captureDoneEvent) {
+            g_captureDoneEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        }
+        g_captureRequested.store(false);
+
         CreateThread(nullptr, 0, InitThread, nullptr, 0, nullptr);
     } else if (reason == DLL_PROCESS_DETACH) {
         Log(L"DLL 正在分离 - selfUnloading=%d", g_selfUnloading);
