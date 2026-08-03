@@ -36,6 +36,35 @@ struct Dx11CaptureShared {
 };
 #pragma pack(pop)
 
+// ============================================================================
+// 坐标点击（后台输入注入）共享内存协议。
+// DLL 已注入游戏进程内部，可直接拿到 swap chain 的输出窗口(HWND)，向其
+// PostMessage(WM_MOUSEMOVE/WM_LBUTTONDOWN/WM_LBUTTONUP)。相比外部进程的
+// SendInput/PostMessage，本方式不依赖前台焦点、坐标为客户区坐标、且与 Unity
+// 输入主线程同进程投递，适合 Unity 游戏后台运行时的坐标点击。
+// 触发方式：
+//   1) 快速路径：script 进程把 (x,y) 写入 OnmyojiDx11ClickShared 共享内存，
+//      再 SetEvent(OnmyojiDx11ClickRequest)。DLL 点击工作线程被唤醒执行。
+//   2) 回退路径：injector -click 经 CreateRemoteThread 调用导出 InjectClick，
+//      内部同样写共享内存 + SetEvent，由同一工作线程执行，保证时序一致。
+// 该结构体布局必须与 script 侧 (Dx11CaptureShared.h::Dx11ClickCommand) 一致。
+// ============================================================================
+static const wchar_t* kClickSharedName       = L"OnmyojiDx11ClickShared";
+static const wchar_t* kClickRequestEventName = L"OnmyojiDx11ClickRequest";
+static const uint32_t kClickMagic   = 0x314B4C43; // 'CLK1'
+static const uint32_t kClickVersion = 1;
+
+#pragma pack(push, 4)
+struct Dx11ClickCommand {
+    uint32_t magic;     // kClickMagic
+    uint32_t version;   // kClickVersion
+    uint32_t sequence;  // 写端每次请求自增
+    uint32_t doneSeq;   // DLL 执行投递后置为本次 sequence
+    int32_t  x;         // 截图像素坐标（与后备缓冲区一致）
+    int32_t  y;
+};
+#pragma pack(pop)
+
 #include "MinHook.h"
 
 using Microsoft::WRL::ComPtr;
@@ -79,6 +108,21 @@ static HANDLE g_crossProcessRequestEvent = nullptr; // auto-reset event
 // 共享内存句柄（在渲染线程首次截图时创建，受 g_deviceCs 保护）
 static HANDLE g_sharedMapping = nullptr;
 static void* g_sharedView = nullptr;
+
+// === 坐标点击状态 ===
+// 输出窗口及其后备缓冲区尺寸，在 hkPresent 中由 swap chain desc 更新。
+// 点击工作线程读取 g_outputHwnd 用于 PostMessage。
+static std::atomic<HWND> g_outputHwnd{ nullptr };
+static std::atomic<uint32_t> g_backBufferW{ 0 };
+static std::atomic<uint32_t> g_backBufferH{ 0 };
+
+static HANDLE g_clickRequestEvent = nullptr;   // auto-reset，跨进程
+static HANDLE g_clickSharedMapping = nullptr;
+static void*  g_clickSharedView = nullptr;
+static HANDLE g_clickThread = nullptr;
+static std::atomic<bool> g_clickThreadStop{ false };
+static CRITICAL_SECTION g_clickCs;             // 保护 g_clickSharedView 读写
+static bool g_clickCsInited = false;
 
 
 // 线程安全的日志系统初始化
@@ -168,6 +212,33 @@ extern "C" __declspec(dllexport) DWORD StopHookAndCleanup() {
         CloseHandle(g_crossProcessRequestEvent);
         g_crossProcessRequestEvent = nullptr;
         Log(L"跨进程截图请求事件已关闭");
+    }
+
+    // === 点击功能清理 ===
+    g_clickThreadStop.store(true);
+    if (g_clickRequestEvent) SetEvent(g_clickRequestEvent); // 唤醒工作线程使其退出
+    if (g_clickThread) {
+        WaitForSingleObject(g_clickThread, 1000);
+        CloseHandle(g_clickThread);
+        g_clickThread = nullptr;
+        Log(L"点击工作线程已结束");
+    }
+    if (g_clickRequestEvent) {
+        CloseHandle(g_clickRequestEvent);
+        g_clickRequestEvent = nullptr;
+    }
+    if (g_clickSharedView) {
+        UnmapViewOfFile(g_clickSharedView);
+        g_clickSharedView = nullptr;
+    }
+    if (g_clickSharedMapping) {
+        CloseHandle(g_clickSharedMapping);
+        g_clickSharedMapping = nullptr;
+        Log(L"点击共享内存已释放");
+    }
+    if (g_clickCsInited) {
+        DeleteCriticalSection(&g_clickCs);
+        g_clickCsInited = false;
     }
 
     // 安全清理D3D资源
@@ -627,6 +698,14 @@ HRESULT STDMETHODCALLTYPE hkPresent(IDXGISwapChain* pSwapChain, UINT SyncInterva
                 if (g_context) {
                     g_initialized.store(true);
                     Log(L"钩子初始化成功 - 设备=%p, 上下文=%p", g_device, g_context);
+                    // 记录输出窗口与后备缓冲区尺寸，供点击工作线程使用
+                    DXGI_SWAP_CHAIN_DESC scd = {};
+                    if (SUCCEEDED(pSwapChain->GetDesc(&scd))) {
+                        g_outputHwnd.store(scd.OutputWindow);
+                        g_backBufferW.store(scd.BufferDesc.Width);
+                        g_backBufferH.store(scd.BufferDesc.Height);
+                        Log(L"输出窗口=%p 后备缓冲区=%ux%u", scd.OutputWindow, scd.BufferDesc.Width, scd.BufferDesc.Height);
+                    }
                 } else {
                     Log(L"GetImmediateContext 失败");
                     g_device->Release();
@@ -698,6 +777,121 @@ HRESULT STDMETHODCALLTYPE hkPresent(IDXGISwapChain* pSwapChain, UINT SyncInterva
 
     // 调用原始函数
     return g_originalPresent(pSwapChain, SyncInterval, Flags);
+}
+
+// 向输出窗口投递一次左键点击（客户区坐标）。
+// 在游戏进程内部 PostMessage，不依赖前台焦点，适合 Unity 后台运行。
+static void PostClickToWindow(HWND hwnd, int x, int y) {
+    if (!hwnd) return;
+    LPARAM lp = MAKELONG(x, y);
+    PostMessageW(hwnd, WM_MOUSEMOVE, 0, lp);
+    Sleep(30);
+    PostMessageW(hwnd, WM_LBUTTONDOWN, MK_LBUTTON, lp);
+    Sleep(40);
+    PostMessageW(hwnd, WM_LBUTTONUP, 0, lp);
+    Log(L"PostClickToWindow hwnd=%p (%d,%d)", hwnd, x, y);
+}
+
+// 点击工作线程
+static DWORD WINAPI ClickWorkerThread(LPVOID) {
+    Log(L"点击工作线程已启动");
+    for (;;) {
+        if (g_clickThreadStop.load()) break;
+        DWORD wr = WaitForSingleObject(g_clickRequestEvent, 200);
+        if (wr == WAIT_TIMEOUT) continue;
+        if (g_clickThreadStop.load()) break;
+        if (wr != WAIT_OBJECT_0) { Sleep(10); continue; }
+
+        int x = 0, y = 0;
+        uint32_t seq = 0;
+        bool valid = false;
+        EnterCriticalSection(&g_clickCs);
+        if (g_clickSharedView) {
+            Dx11ClickCommand* cmd = (Dx11ClickCommand*)g_clickSharedView;
+            if (cmd->magic == kClickMagic && cmd->version == kClickVersion) {
+                x = cmd->x;
+                y = cmd->y;
+                seq = cmd->sequence;
+                valid = true;
+            }
+        }
+        LeaveCriticalSection(&g_clickCs);
+
+        if (!valid) {
+            Log(L"点击请求但共享内存无效，跳过");
+            continue;
+        }
+
+        HWND hwnd = g_outputHwnd.load();
+        if (hwnd) {
+            PostClickToWindow(hwnd, x, y);
+        } else {
+            Log(L"点击请求但输出窗口尚未就绪，跳过 (seq=%u)", seq);
+        }
+
+        // 标记完成，供 InjectClick / script 端轮询确认
+        EnterCriticalSection(&g_clickCs);
+        if (g_clickSharedView) {
+            ((Dx11ClickCommand*)g_clickSharedView)->doneSeq = seq;
+        }
+        LeaveCriticalSection(&g_clickCs);
+    }
+    Log(L"点击工作线程退出");
+    return 0;
+}
+
+// 导出接口：在指定坐标执行一次左键点击
+extern "C" __declspec(dllexport) DWORD InjectClick(LPARAM packedXY) {
+    const int x = (int)(LONG)(uint32_t)(packedXY & 0xFFFFFFFFu);
+    const int y = (int)(LONG)(uint32_t)((packedXY >> 32) & 0xFFFFFFFFu);
+    Log(L"InjectClick 被调用 x=%d y=%d", x, y);
+
+    // 等待钩子初始化与输出窗口就绪
+    for (int i = 0; i < 100; ++i) {
+        if (g_hookStopped.load()) { Log(L"InjectClick: 钩子已停止"); return 0; }
+        if (IsHookInitialized() && g_outputHwnd.load()) break;
+        Sleep(10);
+    }
+    if (!IsHookInitialized() || !g_outputHwnd.load()) {
+        Log(L"InjectClick: 钩子/输出窗口未就绪");
+        return 0;
+    }
+    if (!g_clickCsInited || !g_clickSharedView || !g_clickRequestEvent) {
+        Log(L"InjectClick: 点击共享内存/事件未就绪");
+        return 0;
+    }
+
+    uint32_t mySeq = 0;
+    EnterCriticalSection(&g_clickCs);
+    {
+        Dx11ClickCommand* cmd = (Dx11ClickCommand*)g_clickSharedView;
+        cmd->magic = kClickMagic;
+        cmd->version = kClickVersion;
+        cmd->x = x;
+        cmd->y = y;
+        cmd->sequence += 1;
+        mySeq = cmd->sequence;
+        cmd->doneSeq = 0;
+    }
+    LeaveCriticalSection(&g_clickCs);
+
+    SetEvent(g_clickRequestEvent);
+
+    // 等待工作线程完成投递（最多约 1 秒）
+    for (int i = 0; i < 100; ++i) {
+        if (g_hookStopped.load()) break;
+        Sleep(10);
+        EnterCriticalSection(&g_clickCs);
+        const uint32_t ds = g_clickSharedView
+            ? ((Dx11ClickCommand*)g_clickSharedView)->doneSeq : 0;
+        LeaveCriticalSection(&g_clickCs);
+        if (ds == mySeq) {
+            Log(L"InjectClick 完成 seq=%u", mySeq);
+            return 1;
+        }
+    }
+    Log(L"InjectClick 超时未确认 seq=%u", mySeq);
+    return 0;
 }
 
 static bool HookPresent() {
@@ -798,6 +992,40 @@ BOOL WINAPI DllMain(HMODULE hModule, DWORD reason, LPVOID) {
             }
         }
         g_captureRequested.store(false);
+
+        // === 初始化坐标点击子系统 ===
+        if (!g_clickCsInited) {
+            InitializeCriticalSection(&g_clickCs);
+            g_clickCsInited = true;
+        }
+        if (!g_clickSharedMapping) {
+            g_clickSharedMapping = CreateFileMappingW(
+                INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE,
+                0, sizeof(Dx11ClickCommand), kClickSharedName);
+            if (g_clickSharedMapping) {
+                g_clickSharedView = MapViewOfFile(g_clickSharedMapping,
+                    FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, sizeof(Dx11ClickCommand));
+                if (g_clickSharedView) {
+                    Dx11ClickCommand* cmd = (Dx11ClickCommand*)g_clickSharedView;
+                    cmd->magic = kClickMagic;
+                    cmd->version = kClickVersion;
+                    cmd->sequence = 0;
+                    cmd->doneSeq = 0;
+                    cmd->x = cmd->y = 0;
+                    Log(L"点击共享内存已创建: %s", kClickSharedName);
+                }
+            }
+        }
+        if (!g_clickRequestEvent) {
+            g_clickRequestEvent = CreateEventW(nullptr, FALSE, FALSE, kClickRequestEventName);
+            if (g_clickRequestEvent) {
+                Log(L"点击请求事件已创建: %s", kClickRequestEventName);
+            }
+        }
+        if (!g_clickThread) {
+            g_clickThreadStop.store(false);
+            g_clickThread = CreateThread(nullptr, 0, ClickWorkerThread, nullptr, 0, nullptr);
+        }
 
         CreateThread(nullptr, 0, InitThread, nullptr, 0, nullptr);
     } else if (reason == DLL_PROCESS_DETACH) {
