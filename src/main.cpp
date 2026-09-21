@@ -90,6 +90,18 @@ static bool g_selfUnloading = false;
 static CRITICAL_SECTION g_deviceCs;
 static bool g_deviceCsInited = false;
 
+// === 安全卸载支撑 ===
+// 正在 hkPresent 内执行的线程数（覆盖从进入钩子到调用原始 Present 返回的
+// 全程）。StopHookAndCleanup 禁用钩子后等待其归零，确保渲染线程已离开
+// DLL 代码（含 MinHook trampoline）再执行卸载。
+static std::atomic<int> g_inHookCount{ 0 };
+// 正在导出 API（CaptureFrame/InjectClick/SetLogPath）内执行的外部线程数。
+// 卸载前同样等待归零，避免远程调用线程仍在执行 DLL 代码时 unmap。
+static std::atomic<int> g_apiCallCount{ 0 };
+// 日志停机标志：置位后 Log() 直接返回。修复原实现“DeleteCriticalSection
+// 之后仍调用 Log（含 DLL_PROCESS_DETACH 中的调用）”的未定义行为。
+static std::atomic<bool> g_logShutdown{ false };
+
 // 截图请求：CaptureFrame 在远程线程被调用，但真正的 D3D 操作必须放到渲染线程
 // (hkPresent) 中执行，否则跨线程使用 immediate context 会损坏 GPU 命令流，
 // 概率性导致显卡驱动崩溃/TDR 失败，从而出现全屏花屏、需要重启的严重问题。
@@ -104,6 +116,14 @@ static HANDLE g_captureDoneEvent = nullptr; // 手动重置事件
 // 非阻塞方式检查此事件，触发后执行截图并写入共享内存。
 static const wchar_t* kCaptureRequestEventName = L"OnmyojiDx11CaptureRequest";
 static HANDLE g_crossProcessRequestEvent = nullptr; // auto-reset event
+
+// 跨进程“新帧就绪”事件：SaveTextureToSharedMemory 写完一帧后 SetEvent，
+// script 进程 WaitForSingleObject 等待此事件即可拿到新帧，无需以 2ms 间隔
+// 轮询共享内存序号（每次轮询读 4 字节却要付一次完整的系统调用代价）。
+// auto-reset：script 是唯一等待方，每请求一次消费一次信号；
+// 读端拿到信号后仍按 sequence != prevSeq 二次确认，吃掉旧信号也不会误判。
+static const wchar_t* kCaptureReadyEventName = L"OnmyojiDx11CaptureFrameReady";
+static HANDLE g_crossProcessReadyEvent = nullptr; // auto-reset event
 
 // 共享内存句柄（在渲染线程首次截图时创建，受 g_deviceCs 保护）
 static HANDLE g_sharedMapping = nullptr;
@@ -154,6 +174,7 @@ static std::wstring GetEffectiveLogPath() {
 
 // 日志写入函数
 static void Log(const wchar_t* fmt, ...) {
+    if (g_logShutdown.load()) return; // 日志已停机：不再进入（可能已删除的）临界区
     if (!g_logInited) InitLogSystem();
 
     EnterCriticalSection(&g_logCs);
@@ -182,6 +203,24 @@ static void Log(const wchar_t* fmt, ...) {
     LeaveCriticalSection(&g_logCs);
 }
 
+// 等待原子计数归零（1ms 轮询，带超时）。超时返回 false：调用方应放弃
+// 卸载而不是冒险 unmap——保持已禁用状态、模块常驻不释放，宁可泄漏不崩溃。
+static bool WaitForDrain(std::atomic<int>& count, DWORD timeoutMs) {
+    const ULONGLONG deadline = GetTickCount64() + timeoutMs;
+    while (count.load() != 0) {
+        if (GetTickCount64() >= deadline) return false;
+        Sleep(1);
+    }
+    return true;
+}
+
+// 导出 API 在途计数守卫：StopHookAndCleanup 删除临界区/卸载模块前等待
+// g_apiCallCount 归零，避免远程调用线程仍在执行 DLL 代码时 unmap。
+struct ApiCallGuard {
+    ApiCallGuard() { g_apiCallCount.fetch_add(1); }
+    ~ApiCallGuard() { g_apiCallCount.fetch_sub(1); }
+};
+
 // 修改StopHookAndCleanup函数，在最后添加自卸载
 extern "C" __declspec(dllexport) DWORD StopHookAndCleanup() {
     if (g_cleanupInProgress.exchange(true)) {
@@ -190,15 +229,41 @@ extern "C" __declspec(dllexport) DWORD StopHookAndCleanup() {
     }
 
     Log(L"StopHookAndCleanup 被调用 - 开始清理过程");
+
+    // 1) 先置停止标志：hkPresent 此后透传原始 Present，InitThread 若尚未
+    //    安装钩子则直接跳过。必须发生在任何等待之前，与 hkPresent 中
+    //    “先计数、再检查停止标志”配对（两者均为顺序一致原子操作），保证
+    //    任何交错下在途线程都能被等待方观测到。
     g_hookStopped.store(true);
 
-    // 禁用所有MinHook钩子
+    // 2) 等待初始化线程退出：避免 HookPresent 中的 MinHook 安装与下面的
+    //    Disable/Uninitialize 并发操作 MinHook 内部状态。
+    if (g_hookThread) {
+        if (WaitForSingleObject(g_hookThread, 3000) != WAIT_OBJECT_0) {
+            Log(L"等待初始化线程退出超时，放弃清理以避免崩溃");
+            return 0;
+        }
+        CloseHandle(g_hookThread);
+        g_hookThread = nullptr;
+    }
+
+    // 3) 禁用所有 MinHook 钩子：此后新的 Present 调用直接进入原始函数，
+    //    不再经过 hkPresent。
     MH_STATUS mhStatus = MH_DisableHook(MH_ALL_HOOKS);
     if (mhStatus != MH_OK) {
         Log(L"MH_DisableHook 失败，状态: %d", mhStatus);
     }
 
-    Sleep(100);
+    // 4) 排空正在 hkPresent 内执行的渲染线程。
+    //    原实现为固定 Sleep(100)：低帧率、或一次截图（含 PNG 编码耗时
+    //    数百毫秒）恰好在途时，100ms 不足以让渲染线程离开 DLL 代码，
+    //    随后 MH_Uninitialize 释放 trampoline、unmap 模块导致闪退。
+    //    现改为等待计数归零；超时则放弃卸载（保持已禁用状态，模块常驻）。
+    if (!WaitForDrain(g_inHookCount, 5000)) {
+        Log(L"等待渲染线程退出 hkPresent 超时 (inHook=%d)，放弃卸载",
+            g_inHookCount.load());
+        return 0;
+    }
 
     // 唤醒任何正在等待截图完成的远程线程，避免其一直阻塞。
     g_captureRequested.store(false);
@@ -214,15 +279,38 @@ extern "C" __declspec(dllexport) DWORD StopHookAndCleanup() {
         Log(L"跨进程截图请求事件已关闭");
     }
 
+    // 关闭跨进程“新帧就绪”事件
+    if (g_crossProcessReadyEvent) {
+        CloseHandle(g_crossProcessReadyEvent);
+        g_crossProcessReadyEvent = nullptr;
+        Log(L"跨进程新帧就绪事件已关闭");
+    }
+
     // === 点击功能清理 ===
+    // 置停止标志并唤醒工作线程；必须等它退出后才能删除其使用的临界区。
     g_clickThreadStop.store(true);
     if (g_clickRequestEvent) SetEvent(g_clickRequestEvent); // 唤醒工作线程使其退出
     if (g_clickThread) {
-        WaitForSingleObject(g_clickThread, 1000);
+        if (WaitForSingleObject(g_clickThread, 2000) != WAIT_OBJECT_0) {
+            Log(L"点击工作线程未在超时内退出，放弃清理以避免崩溃");
+            return 0;
+        }
         CloseHandle(g_clickThread);
         g_clickThread = nullptr;
         Log(L"点击工作线程已结束");
     }
+
+    // === 排空在途的导出 API 调用（CaptureFrame/InjectClick 等远程线程）===
+    // 这些线程已被上文唤醒，或通过各自的 g_hookStopped 检查快速退出。
+    // 必须等它们全部离开后才能删除它们使用过的临界区并卸载模块。
+    if (!WaitForDrain(g_apiCallCount, 5000)) {
+        Log(L"等待在途远程 API 调用退出超时 (apiCalls=%d)，放弃卸载",
+            g_apiCallCount.load());
+        return 0;
+    }
+
+    // 此后不再有任何其它线程执行 DLL 代码（渲染线程、初始化线程、点击
+    // 工作线程、远程调用线程均已离开），以下资源清理可以安全进行。
     if (g_clickRequestEvent) {
         CloseHandle(g_clickRequestEvent);
         g_clickRequestEvent = nullptr;
@@ -284,8 +372,7 @@ extern "C" __declspec(dllexport) DWORD StopHookAndCleanup() {
         Log(L"MinHook 取消初始化成功");
     }
 
-    // 4. 清理日志系统
-    Log(L"正在清理日志系统");
+    // 4. 清理日志系统（最后一批日志，随后停机）
     Log(L"StopHookAndCleanup 完成成功");
 
     if (g_captureDoneEvent) {
@@ -298,24 +385,27 @@ extern "C" __declspec(dllexport) DWORD StopHookAndCleanup() {
         g_deviceCsInited = false;
     }
 
+    Log(L"准备卸载 DLL (hModule=%p)", g_hModule);
+
+    // 5. 日志停机：置位后 Log() 直接返回——包括 unmap 触发的
+    //    DLL_PROCESS_DETACH 中的调用。原实现在 DeleteCriticalSection 之后
+    //    仍调用 Log（此处及 DLL 分离时），是退出闪退的根源之一。
+    g_logShutdown.store(true);
     if (g_logInited) {
         DeleteCriticalSection(&g_logCs);
         g_logInited = false;
-        Log(L"临界区已删除");
     }
 
-    // 5. 强制自卸载
-    Log(L"准备强制卸载 DLL");
-    Sleep(100);
+    // 6. 收尾余量：计数归零的线程可能停在“fetch_sub 之后、函数返回之前”
+    //    的几条指令上（恰被调度器抢占）。短暂等待覆盖该窗口再卸载。
+    Sleep(50);
 
+    // 7. 自卸载：FreeLibraryAndExitThread 专为“线程可能仍执行本 DLL 代码”
+    //    的场景设计——递减引用计数、（若降为 0 则 unmap）并直接从 kernel32
+    //    退出线程，不再返回本 DLL 代码。
     if (g_hModule) {
         g_selfUnloading = true; // 标记为自卸载
-        Log(L"调用 FreeLibraryAndExitThread，hModule=%p", g_hModule);
-
-        // 强制卸载
         FreeLibraryAndExitThread(g_hModule, 1);
-    } else {
-        Log(L"g_hModule 为 null，无法卸载");
     }
 
     return 1;
@@ -333,6 +423,7 @@ extern "C" __declspec(dllexport) bool IsHookInitialized() {
 
 // 导出接口：设置日志路径（线程安全）
 extern "C" __declspec(dllexport) void SetLogPath(const wchar_t* path) {
+    ApiCallGuard apiGuard;
     InitLogSystem();
     EnterCriticalSection(&g_logCs);
 
@@ -442,6 +533,11 @@ static bool SaveTextureToSharedMemory(ID3D11Texture2D* src) {
     hdr->channels = 4;
     hdr->dataSize = rowBytes * desc.Height;
     hdr->sequence += 1;
+
+    // 通知读端新帧就绪：script 进程等待此事件，替代 2ms 轮询序号
+    if (g_crossProcessReadyEvent) {
+        SetEvent(g_crossProcessReadyEvent);
+    }
 
     Log(L"已写入共享内存 (宽x高=%u x %u, seq=%u)", desc.Width, desc.Height, hdr->sequence);
     return true;
@@ -605,6 +701,7 @@ static bool SaveTextureToPngWithManualSwap(ID3D11Texture2D* src, const std::wstr
 
 // 改进的CaptureFrame函数 - 整合了两个版本的功能
 extern "C" __declspec(dllexport) DWORD CaptureFrame(const wchar_t* savePath) {
+    ApiCallGuard apiGuard;
     if (!savePath) {
         Log(L"CaptureFrame 被调用，路径为 null");
         return 0;
@@ -612,18 +709,20 @@ extern "C" __declspec(dllexport) DWORD CaptureFrame(const wchar_t* savePath) {
 
     Log(L"CaptureFrame 被调用，路径=%s", savePath);
 
-    // 等待初始化完成（减少等待时间）
+    // 等待初始化完成（减少等待时间）；钩子停止时立即放弃，便于
+    // StopHookAndCleanup 快速排空在途调用。
     const int maxWaitMs = 1000; // 从2000ms减少到1000ms
     const int waitInterval = 10;
     int waited = 0;
 
-    while (!IsHookInitialized() && waited < maxWaitMs / waitInterval) {
+    while (!IsHookInitialized() && !g_hookStopped.load() && waited < maxWaitMs / waitInterval) {
         Sleep(waitInterval);
         waited++;
     }
 
-    if (!IsHookInitialized()) {
-        Log(L"钩子未在 %d 毫秒后初始化", waited * waitInterval);
+    if (g_hookStopped.load() || !IsHookInitialized()) {
+        Log(L"钩子未就绪或已停止 (waited=%d ms, stopped=%d)",
+            waited * waitInterval, (int)g_hookStopped.load());
         return 0;
     }
 
@@ -666,9 +765,17 @@ extern "C" __declspec(dllexport) DWORD CaptureFrame(const wchar_t* savePath) {
 
 // Present hook implementation
 HRESULT STDMETHODCALLTYPE hkPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT Flags) {
-    // 如果已经停止，直接调用原始函数
+    // 先登记“正在钩子内执行”，再检查停止标志（两者均为顺序一致原子操作）：
+    // 与 StopHookAndCleanup 中“先置停止标志、禁用钩子后等计数归零”配对，
+    // 保证任何交错下停止线程都能观测到本线程，不会在渲染线程仍在 DLL
+    // 代码内执行时卸载模块。
+    g_inHookCount.fetch_add(1);
+
+    // 如果已经停止，直接透传原始函数，尽快离开 DLL 代码
     if (g_hookStopped.load()) {
-        return g_originalPresent(pSwapChain, SyncInterval, Flags);
+        HRESULT hr = g_originalPresent(pSwapChain, SyncInterval, Flags);
+        g_inHookCount.fetch_sub(1);
+        return hr;
     }
 
     // 关键修复：只在必要时更新交换链指针
@@ -775,8 +882,11 @@ HRESULT STDMETHODCALLTYPE hkPresent(IDXGISwapChain* pSwapChain, UINT SyncInterva
         if (g_captureDoneEvent) SetEvent(g_captureDoneEvent);
     }
 
-    // 调用原始函数
-    return g_originalPresent(pSwapChain, SyncInterval, Flags);
+    // 调用原始函数，返回前登记退出：递减后本函数仅剩返回指令，
+    // StopHookAndCleanup 的收尾余量（Sleep(50)）覆盖该窗口
+    HRESULT hr = g_originalPresent(pSwapChain, SyncInterval, Flags);
+    g_inHookCount.fetch_sub(1);
+    return hr;
 }
 
 // 向输出窗口投递一次左键点击（客户区坐标）。
@@ -842,6 +952,7 @@ static DWORD WINAPI ClickWorkerThread(LPVOID) {
 
 // 导出接口：在指定坐标执行一次左键点击
 extern "C" __declspec(dllexport) DWORD InjectClick(LPARAM packedXY) {
+    ApiCallGuard apiGuard;
     const int x = (int)(LONG)(uint32_t)(packedXY & 0xFFFFFFFFu);
     const int y = (int)(LONG)(uint32_t)((packedXY >> 32) & 0xFFFFFFFFu);
     Log(L"InjectClick 被调用 x=%d y=%d", x, y);
@@ -948,8 +1059,9 @@ static bool HookPresent() {
 }
 
 DWORD WINAPI InitThread(LPVOID) {
-    g_hookThread = GetCurrentThread(); // 保存当前线程句柄
-
+    // g_hookThread 已在 DllMain 中保存为 CreateThread 返回的真实句柄，
+    // 供 StopHookAndCleanup 等待本线程退出（原实现误存 GetCurrentThread()
+    // 伪句柄，无法用于跨线程等待/关闭）。
     // g_logCs 已在 DllMain 中经 InitLogSystem 初始化，切勿重复 InitializeCriticalSection。
     Log(L"DLL 已附加，启动钩子线程");
 
@@ -991,6 +1103,14 @@ BOOL WINAPI DllMain(HMODULE hModule, DWORD reason, LPVOID) {
                 Log(L"跨进程截图请求事件已创建: %s", kCaptureRequestEventName);
             }
         }
+        // 创建跨进程“新帧就绪”事件（auto-reset），script 进程等待此事件读取新帧，
+        // 替代轮询共享内存序号。旧版 script 进程不打开它，行为不受影响。
+        if (!g_crossProcessReadyEvent) {
+            g_crossProcessReadyEvent = CreateEventW(nullptr, FALSE, FALSE, kCaptureReadyEventName);
+            if (g_crossProcessReadyEvent) {
+                Log(L"跨进程新帧就绪事件已创建: %s", kCaptureReadyEventName);
+            }
+        }
         g_captureRequested.store(false);
 
         // === 初始化坐标点击子系统 ===
@@ -1027,7 +1147,11 @@ BOOL WINAPI DllMain(HMODULE hModule, DWORD reason, LPVOID) {
             g_clickThread = CreateThread(nullptr, 0, ClickWorkerThread, nullptr, 0, nullptr);
         }
 
-        CreateThread(nullptr, 0, InitThread, nullptr, 0, nullptr);
+        // 保存真实句柄：StopHookAndCleanup 需等待本线程退出，避免
+        // HookPresent 安装钩子与停止清理并发操作 MinHook 内部状态。
+        if (!g_hookThread) {
+            g_hookThread = CreateThread(nullptr, 0, InitThread, nullptr, 0, nullptr);
+        }
     } else if (reason == DLL_PROCESS_DETACH) {
         Log(L"DLL 正在分离 - selfUnloading=%d", g_selfUnloading);
         if (!g_selfUnloading && !g_hookStopped.load()) {
