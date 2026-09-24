@@ -438,7 +438,15 @@ extern "C" __declspec(dllexport) void SetLogPath(const wchar_t* path) {
     LeaveCriticalSection(&g_logCs);
 
     // 使用副本记录日志，避免竞争条件
-    Log(L"日志路径设置为: %s", logPathToLog.empty() ? L"<TEMP>" : logPathToLog.c_str());
+    Log(L"日志路径设置为: %ls", logPathToLog.empty() ? L"<TEMP>" : logPathToLog.c_str());
+
+    // 注入瞬间（DllMain）的初始化日志写入时日志路径尚未设置，只能落到
+    // %TEMP% 回退文件；此处补记关键子系统状态，保证正式日志可见完整注入链路。
+    Log(L"注入状态补记: 截图请求事件=%ls, 新帧就绪事件=%ls, 点击请求事件=%ls, 钩子已停止=%d",
+        g_crossProcessRequestEvent ? L"已创建" : L"未创建",
+        g_crossProcessReadyEvent ? L"已创建" : L"未创建",
+        g_clickRequestEvent ? L"已创建" : L"未创建",
+        (int)g_hookStopped.load());
 }
 
 // 确保命名共享内存已创建（仅在渲染线程、持有 g_deviceCs 时调用）。
@@ -472,7 +480,7 @@ static bool EnsureSharedMemory() {
     hdr->status = 1;
     hdr->width = hdr->height = hdr->channels = hdr->dataSize = 0;
 
-    Log(L"共享内存已创建: %s (容量=%llu 字节)", kDx11SharedName, (unsigned long long)total);
+    Log(L"共享内存已创建: %ls (容量=%llu 字节)", kDx11SharedName, (unsigned long long)total);
     return true;
 }
 
@@ -539,7 +547,9 @@ static bool SaveTextureToSharedMemory(ID3D11Texture2D* src) {
         SetEvent(g_crossProcessReadyEvent);
     }
 
-    Log(L"已写入共享内存 (宽x高=%u x %u, seq=%u)", desc.Width, desc.Height, hdr->sequence);
+    // 不逐帧记日志：本函数每帧被调用，而 Log 每条都要开文件+flush+关文件，
+    // 会造成 dx11_log.txt 快速膨胀与无谓 I/O。失败路径（分辨率超限、创建
+    // staging 失败等）均已各自记录日志，此处静默成功即可。
     return true;
 }
 
@@ -695,7 +705,7 @@ static bool SaveTextureToPngWithManualSwap(ID3D11Texture2D* src, const std::wstr
 
     if (shouldUninit) CoUninitialize();
     Log(L"后备缓冲区格式 = %u, 手动交换 BGR->RGB", desc.Format);
-    Log(L"已保存 PNG: %s (宽x高=%u x %u)", path.c_str(), desc.Width, desc.Height);
+    Log(L"已保存 PNG: %ls (宽x高=%u x %u)", path.c_str(), desc.Width, desc.Height);
     return true;
 }
 
@@ -707,7 +717,7 @@ extern "C" __declspec(dllexport) DWORD CaptureFrame(const wchar_t* savePath) {
         return 0;
     }
 
-    Log(L"CaptureFrame 被调用，路径=%s", savePath);
+    Log(L"CaptureFrame 被调用，路径=%ls", savePath);
 
     // 等待初始化完成（减少等待时间）；钩子停止时立即放弃，便于
     // StopHookAndCleanup 快速排空在途调用。
@@ -866,7 +876,7 @@ HRESULT STDMETHODCALLTYPE hkPresent(IDXGISwapChain* pSwapChain, UINT SyncInterva
                     // 可选：按开关额外持久化为 PNG。
                     if (persist && !path.empty()) {
                         if (!SaveTextureToPngWithManualSwap(back.Get(), path)) {
-                            Log(L"PNG 持久化失败: %s", path.c_str());
+                            Log(L"PNG 持久化失败: %ls", path.c_str());
                         }
                     }
                     result = sharedOk ? 1 : 0;
@@ -1100,7 +1110,7 @@ BOOL WINAPI DllMain(HMODULE hModule, DWORD reason, LPVOID) {
         if (!g_crossProcessRequestEvent) {
             g_crossProcessRequestEvent = CreateEventW(nullptr, FALSE, FALSE, kCaptureRequestEventName);
             if (g_crossProcessRequestEvent) {
-                Log(L"跨进程截图请求事件已创建: %s", kCaptureRequestEventName);
+                Log(L"跨进程截图请求事件已创建: %ls", kCaptureRequestEventName);
             }
         }
         // 创建跨进程“新帧就绪”事件（auto-reset），script 进程等待此事件读取新帧，
@@ -1108,7 +1118,7 @@ BOOL WINAPI DllMain(HMODULE hModule, DWORD reason, LPVOID) {
         if (!g_crossProcessReadyEvent) {
             g_crossProcessReadyEvent = CreateEventW(nullptr, FALSE, FALSE, kCaptureReadyEventName);
             if (g_crossProcessReadyEvent) {
-                Log(L"跨进程新帧就绪事件已创建: %s", kCaptureReadyEventName);
+                Log(L"跨进程新帧就绪事件已创建: %ls", kCaptureReadyEventName);
             }
         }
         g_captureRequested.store(false);
@@ -1132,14 +1142,14 @@ BOOL WINAPI DllMain(HMODULE hModule, DWORD reason, LPVOID) {
                     cmd->sequence = 0;
                     cmd->doneSeq = 0;
                     cmd->x = cmd->y = 0;
-                    Log(L"点击共享内存已创建: %s", kClickSharedName);
+                    Log(L"点击共享内存已创建: %ls", kClickSharedName);
                 }
             }
         }
         if (!g_clickRequestEvent) {
             g_clickRequestEvent = CreateEventW(nullptr, FALSE, FALSE, kClickRequestEventName);
             if (g_clickRequestEvent) {
-                Log(L"点击请求事件已创建: %s", kClickRequestEventName);
+                Log(L"点击请求事件已创建: %ls", kClickRequestEventName);
             }
         }
         if (!g_clickThread) {
