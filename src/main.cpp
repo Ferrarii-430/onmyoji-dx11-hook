@@ -4,6 +4,7 @@
 #include <dxgi.h>
 #include <wrl/client.h>
 #include <wincodec.h>
+#include <cmath>
 #include <cstdio>
 #include <cstdarg>
 #include <cstdint>
@@ -37,22 +38,29 @@ struct Dx11CaptureShared {
 #pragma pack(pop)
 
 // ============================================================================
-// 坐标点击（后台输入注入）共享内存协议。
+// 坐标点击/滑动（后台输入注入）共享内存协议。
 // DLL 已注入游戏进程内部，可直接拿到 swap chain 的输出窗口(HWND)，向其
 // PostMessage(WM_MOUSEMOVE/WM_LBUTTONDOWN/WM_LBUTTONUP)。相比外部进程的
 // SendInput/PostMessage，本方式不依赖前台焦点、坐标为客户区坐标、且与 Unity
-// 输入主线程同进程投递，适合 Unity 游戏后台运行时的坐标点击。
+// 输入主线程同进程投递，适合 Unity 游戏后台运行时的坐标点击/滑动。
 // 触发方式：
-//   1) 快速路径：script 进程把 (x,y) 写入 OnmyojiDx11ClickShared 共享内存，
+//   1) 快速路径：script 进程把命令写入 OnmyojiDx11ClickShared 共享内存，
 //      再 SetEvent(OnmyojiDx11ClickRequest)。DLL 点击工作线程被唤醒执行。
-//   2) 回退路径：injector -click 经 CreateRemoteThread 调用导出 InjectClick，
-//      内部同样写共享内存 + SetEvent，由同一工作线程执行，保证时序一致。
+//   2) 回退路径：injector -click/-swipe 经 CreateRemoteThread 调用导出
+//      InjectClick/InjectSwipe，内部同样写共享内存 + SetEvent，
+//      由同一工作线程执行，保证时序一致。
 // 该结构体布局必须与 script 侧 (Dx11CaptureShared.h::Dx11ClickCommand) 一致。
 // ============================================================================
 static const wchar_t* kClickSharedName       = L"OnmyojiDx11ClickShared";
 static const wchar_t* kClickRequestEventName = L"OnmyojiDx11ClickRequest";
 static const uint32_t kClickMagic   = 0x314B4C43; // 'CLK1'
-static const uint32_t kClickVersion = 1;
+static const uint32_t kClickVersion = 2;
+
+// 滑动轨迹类型常量，取值与 script 侧 Dx11CaptureShared.h 保持一致
+static const uint32_t kSwipeTrajectoryLinear     = 0;
+static const uint32_t kSwipeTrajectoryBezier     = 1;
+static const uint32_t kSwipeTrajectorySCurve     = 2;
+static const uint32_t kSwipeTrajectoryRandomWalk = 3;
 
 #pragma pack(push, 4)
 struct Dx11ClickCommand {
@@ -60,8 +68,13 @@ struct Dx11ClickCommand {
     uint32_t version;   // kClickVersion
     uint32_t sequence;  // 写端每次请求自增
     uint32_t doneSeq;   // DLL 执行投递后置为本次 sequence
-    int32_t  x;         // 截图像素坐标（与后备缓冲区一致）
+    int32_t  x;         // 起点，截图像素坐标（与后备缓冲区一致）
     int32_t  y;
+    // ---- v2 新增：滑动扩展字段（单击时 x2==x && y2==y）----
+    int32_t  x2;        // 滑动终点（抬起点）；单击时与 x/y 相同
+    int32_t  y2;
+    uint32_t trajectory; // 滑动轨迹类型；单击时忽略
+    uint32_t durationMs; // 按下到抬起的总时长；0 视为单击
 };
 #pragma pack(pop)
 
@@ -912,6 +925,114 @@ static void PostClickToWindow(HWND hwnd, int x, int y) {
     Log(L"PostClickToWindow hwnd=%p (%d,%d)", hwnd, x, y);
 }
 
+// 简易随机数（xorshift32）：滑动抖动/随机漫步用，无需 CRT。
+static uint32_t SwipeRand(uint32_t& state) {
+    state ^= state << 13;
+    state ^= state >> 17;
+    state ^= state << 5;
+    return state;
+}
+
+static int SwipeRandRange(uint32_t& state, int minV, int maxV) {
+    if (maxV <= minV) return minV;
+    return minV + (int)(SwipeRand(state) % (uint32_t)(maxV - minV + 1));
+}
+
+// 生成滑动轨迹点（客户区坐标）：与 script 侧约定相同的四种轨迹类型。
+// 首点为起点，末点恒为终点。
+static std::vector<POINT> GenerateSwipeTrajectory(POINT start, POINT end,
+                                                  uint32_t trajectory, int steps) {
+    std::vector<POINT> pts;
+    if (steps < 2) steps = 2;
+
+    auto pushPoint = [&pts](int x, int y) { pts.push_back({x, y}); };
+
+    switch (trajectory) {
+    case kSwipeTrajectoryBezier: {
+        // 三次贝塞尔：控制点仿照 script 侧 MouseSimulator 的取法
+        POINT c1 = { start.x + (end.x - start.x) / 3,
+                     start.y - (end.y - start.y) / 4 };
+        POINT c2 = { start.x + 2 * (end.x - start.x) / 3,
+                     end.y + (end.y - start.y) / 4 };
+        for (int i = 0; i <= steps; ++i) {
+            const float t = (float)i / steps;
+            const float u = 1.0f - t;
+            const int x = (int)(u*u*u*start.x + 3*u*u*t*c1.x + 3*u*t*t*c2.x + t*t*t*end.x);
+            const int y = (int)(u*u*u*start.y + 3*u*u*t*c1.y + 3*u*t*t*c2.y + t*t*t*end.y);
+            pushPoint(x, y);
+        }
+        break;
+    }
+    case kSwipeTrajectorySCurve: {
+        for (int i = 0; i <= steps; ++i) {
+            const float t = (float)i / steps;
+            const float s = sinf(t * 3.14159f);
+            pushPoint(start.x + (int)(t * (end.x - start.x)),
+                      start.y + (int)(s * 30 + t * (end.y - start.y)));
+        }
+        break;
+    }
+    case kSwipeTrajectoryRandomWalk: {
+        uint32_t seed = GetTickCount();
+        seed ^= seed << 16; // 避免种子过小的低熵情况
+        pushPoint(start.x, start.y);
+        const int totalSteps = steps * 2;
+        for (int i = 1; i < totalSteps; ++i) {
+            const float progress = (float)i / totalSteps;
+            pushPoint(start.x + (int)(progress * (end.x - start.x)) + SwipeRandRange(seed, -10, 10),
+                      start.y + (int)(progress * (end.y - start.y)) + SwipeRandRange(seed, -10, 10));
+        }
+        pushPoint(end.x, end.y);
+        break;
+    }
+    case kSwipeTrajectoryLinear:
+    default: {
+        for (int i = 0; i <= steps; ++i) {
+            const float t = (float)i / steps;
+            pushPoint(start.x + (int)(t * (end.x - start.x)),
+                      start.y + (int)(t * (end.y - start.y)));
+        }
+        break;
+    }
+    }
+    return pts;
+}
+
+// 向输出窗口投递一次左键按下滑动（客户区坐标）：
+// 移到起点 → 按下并短暂停留 → 沿轨迹按时长均分间隔移动 → 终点抬起。
+// 按下期间 WM_MOUSEMOVE 的 wParam 必须携带 MK_LBUTTON，否则收不到拖动手势语义。
+static void PostSwipeToWindow(HWND hwnd, int x1, int y1, int x2, int y2,
+                              uint32_t trajectory, uint32_t durationMs) {
+    if (!hwnd) return;
+    if (durationMs == 0) durationMs = 500;
+    if (durationMs > 30000) durationMs = 30000;
+
+    // 未按下先把光标移到起点
+    PostMessageW(hwnd, WM_MOUSEMOVE, 0, MAKELONG(x1, y1));
+    Sleep(30);
+
+    // 在起点按下左键并短暂停留：停留过短会被判定为点击而非拖动手势
+    PostMessageW(hwnd, WM_LBUTTONDOWN, MK_LBUTTON, MAKELONG(x1, y1));
+    Sleep(100);
+
+    // 按步进间隔估算轨迹点数，时长均分到每个移动点
+    const int steps = (int)(durationMs / 15) > 8 ? (int)(durationMs / 15) : 8;
+    std::vector<POINT> pts = GenerateSwipeTrajectory({x1, y1}, {x2, y2}, trajectory, steps);
+    if (pts.size() > 1) {
+        pts.erase(pts.begin()); // 首点与按下位置重复，跳过
+    }
+
+    const int perMove = pts.empty() ? (int)durationMs : (int)(durationMs / pts.size());
+    for (const POINT& pt : pts) {
+        PostMessageW(hwnd, WM_MOUSEMOVE, MK_LBUTTON, MAKELONG(pt.x, pt.y));
+        Sleep(perMove > 1 ? perMove : 1);
+    }
+
+    PostMessageW(hwnd, WM_LBUTTONUP, 0, MAKELONG(x2, y2));
+    Log(L"PostSwipeToWindow hwnd=%p (%d,%d)->(%d,%d) traj=%u dur=%ums",
+        hwnd, x1, y1, x2, y2, trajectory, durationMs);
+}
+
 // 点击工作线程
 static DWORD WINAPI ClickWorkerThread(LPVOID) {
     Log(L"点击工作线程已启动");
@@ -922,7 +1043,8 @@ static DWORD WINAPI ClickWorkerThread(LPVOID) {
         if (g_clickThreadStop.load()) break;
         if (wr != WAIT_OBJECT_0) { Sleep(10); continue; }
 
-        int x = 0, y = 0;
+        int x = 0, y = 0, x2 = 0, y2 = 0;
+        uint32_t trajectory = 0, durationMs = 0;
         uint32_t seq = 0;
         bool valid = false;
         EnterCriticalSection(&g_clickCs);
@@ -931,6 +1053,10 @@ static DWORD WINAPI ClickWorkerThread(LPVOID) {
             if (cmd->magic == kClickMagic && cmd->version == kClickVersion) {
                 x = cmd->x;
                 y = cmd->y;
+                x2 = cmd->x2;
+                y2 = cmd->y2;
+                trajectory = cmd->trajectory;
+                durationMs = cmd->durationMs;
                 seq = cmd->sequence;
                 valid = true;
             }
@@ -938,13 +1064,18 @@ static DWORD WINAPI ClickWorkerThread(LPVOID) {
         LeaveCriticalSection(&g_clickCs);
 
         if (!valid) {
-            Log(L"点击请求但共享内存无效，跳过");
+            Log(L"点击请求但共享内存无效（版本不匹配或已损坏），跳过");
             continue;
         }
 
         HWND hwnd = g_outputHwnd.load();
         if (hwnd) {
-            PostClickToWindow(hwnd, x, y);
+            const bool isSwipe = (x2 != x || y2 != y) && durationMs > 0;
+            if (isSwipe) {
+                PostSwipeToWindow(hwnd, x, y, x2, y2, trajectory, durationMs);
+            } else {
+                PostClickToWindow(hwnd, x, y);
+            }
         } else {
             Log(L"点击请求但输出窗口尚未就绪，跳过 (seq=%u)", seq);
         }
@@ -960,25 +1091,23 @@ static DWORD WINAPI ClickWorkerThread(LPVOID) {
     return 0;
 }
 
-// 导出接口：在指定坐标执行一次左键点击
-extern "C" __declspec(dllexport) DWORD InjectClick(LPARAM packedXY) {
-    ApiCallGuard apiGuard;
-    const int x = (int)(LONG)(uint32_t)(packedXY & 0xFFFFFFFFu);
-    const int y = (int)(LONG)(uint32_t)((packedXY >> 32) & 0xFFFFFFFFu);
-    Log(L"InjectClick 被调用 x=%d y=%d", x, y);
-
+// 导出接口共用的核心：把一条点击/滑动命令写入共享内存并唤醒工作线程，
+// 轮询 doneSeq 确认执行完成。滑动时 doneSeq 在整个手势投递完成后才置位，
+// 故确认超时按 durationMs 放宽。
+static DWORD InjectClickCore(int x, int y, int x2, int y2,
+                             uint32_t trajectory, uint32_t durationMs, const wchar_t* tag) {
     // 等待钩子初始化与输出窗口就绪
     for (int i = 0; i < 100; ++i) {
-        if (g_hookStopped.load()) { Log(L"InjectClick: 钩子已停止"); return 0; }
+        if (g_hookStopped.load()) { Log(L"%s: 钩子已停止", tag); return 0; }
         if (IsHookInitialized() && g_outputHwnd.load()) break;
         Sleep(10);
     }
     if (!IsHookInitialized() || !g_outputHwnd.load()) {
-        Log(L"InjectClick: 钩子/输出窗口未就绪");
+        Log(L"%s: 钩子/输出窗口未就绪", tag);
         return 0;
     }
     if (!g_clickCsInited || !g_clickSharedView || !g_clickRequestEvent) {
-        Log(L"InjectClick: 点击共享内存/事件未就绪");
+        Log(L"%s: 点击共享内存/事件未就绪", tag);
         return 0;
     }
 
@@ -990,6 +1119,10 @@ extern "C" __declspec(dllexport) DWORD InjectClick(LPARAM packedXY) {
         cmd->version = kClickVersion;
         cmd->x = x;
         cmd->y = y;
+        cmd->x2 = x2;
+        cmd->y2 = y2;
+        cmd->trajectory = trajectory;
+        cmd->durationMs = durationMs;
         cmd->sequence += 1;
         mySeq = cmd->sequence;
         cmd->doneSeq = 0;
@@ -998,8 +1131,10 @@ extern "C" __declspec(dllexport) DWORD InjectClick(LPARAM packedXY) {
 
     SetEvent(g_clickRequestEvent);
 
-    // 等待工作线程完成投递（最多约 1 秒）
-    for (int i = 0; i < 100; ++i) {
+    // 等待工作线程完成投递：单击约 1 秒；滑动为整个手势时长 + 3 秒余量
+    const bool isSwipe = (x2 != x || y2 != y) && durationMs > 0;
+    const int waitMs = isSwipe ? (int)durationMs + 3000 : 1000;
+    for (int elapsed = 0; elapsed < waitMs; elapsed += 10) {
         if (g_hookStopped.load()) break;
         Sleep(10);
         EnterCriticalSection(&g_clickCs);
@@ -1007,12 +1142,50 @@ extern "C" __declspec(dllexport) DWORD InjectClick(LPARAM packedXY) {
             ? ((Dx11ClickCommand*)g_clickSharedView)->doneSeq : 0;
         LeaveCriticalSection(&g_clickCs);
         if (ds == mySeq) {
-            Log(L"InjectClick 完成 seq=%u", mySeq);
+            Log(L"%s 完成 seq=%u", tag, mySeq);
             return 1;
         }
     }
-    Log(L"InjectClick 超时未确认 seq=%u", mySeq);
+    Log(L"%s 超时未确认 seq=%u", tag, mySeq);
     return 0;
+}
+
+// 导出接口：在指定坐标执行一次左键点击
+extern "C" __declspec(dllexport) DWORD InjectClick(LPARAM packedXY) {
+    ApiCallGuard apiGuard;
+    const int x = (int)(LONG)(uint32_t)(packedXY & 0xFFFFFFFFu);
+    const int y = (int)(LONG)(uint32_t)((packedXY >> 32) & 0xFFFFFFFFu);
+    Log(L"InjectClick 被调用 x=%d y=%d", x, y);
+    return InjectClickCore(x, y, x, y, 0, 0, L"InjectClick");
+}
+
+// 导出接口：执行一次左键按下滑动。注入器经 CreateRemoteThread 传入远程内存
+// 指针，指向 SwipeParams 结构（与注入器侧布局一致）。
+struct Dx11SwipeParams {
+    int32_t  x1;
+    int32_t  y1;
+    int32_t  x2;
+    int32_t  y2;
+    uint32_t trajectory; // 见 kSwipeTrajectory* 常量
+    uint32_t durationMs;
+};
+
+extern "C" __declspec(dllexport) DWORD InjectSwipe(const void* remoteParams) {
+    ApiCallGuard apiGuard;
+    Dx11SwipeParams p = {};
+    if (remoteParams) {
+        // 远程指针由注入器 VirtualAllocEx 写入，读前校验可读性
+        //（MinGW 无 __try/__except，不能用 SEH 守护）
+        if (IsBadReadPtr(remoteParams, sizeof(Dx11SwipeParams))) {
+            Log(L"InjectSwipe: 参数内存不可读 (0x%p)", remoteParams);
+            return 0;
+        }
+        p = *static_cast<const Dx11SwipeParams*>(remoteParams);
+    }
+    Log(L"InjectSwipe 被调用 (%d,%d)->(%d,%d) traj=%u dur=%ums",
+        p.x1, p.y1, p.x2, p.y2, p.trajectory, p.durationMs);
+    return InjectClickCore(p.x1, p.y1, p.x2, p.y2,
+                           p.trajectory, p.durationMs, L"InjectSwipe");
 }
 
 static bool HookPresent() {
