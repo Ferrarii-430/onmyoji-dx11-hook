@@ -16,7 +16,21 @@
 // file mapping，script 进程可直接映射读取，无需 PNG 落盘/解码中转。
 // 该结构体布局必须与 script 侧 (Dx11CaptureShared.h) 保持完全一致。
 // ============================================================================
-static const wchar_t* kDx11SharedName = L"OnmyojiDx11CaptureShared";
+
+// 命名对象名 = 固定前缀 + "_" + 当前进程 PID。
+// 多开时每个游戏进程各注入一份 DLL，若共用固定名会互相覆写像素数据，
+// 表现为「A 窗口的截图里出现 B 窗口的画面」。规则必须与脚本侧
+// src/game/GameContext.h 完全一致，否则会注入成功但永远截不到图。
+static std::wstring MakePidScopedName(const wchar_t* prefix) {
+    return std::wstring(prefix) + L"_" + std::to_wstring(GetCurrentProcessId());
+}
+
+// 函数内 static：保证在 DLL 被加载后才求值，此时 GetCurrentProcessId() 有效
+static const std::wstring& CaptureSharedName() {
+    static const std::wstring name = MakePidScopedName(L"OnmyojiDx11CaptureShared");
+    return name;
+}
+
 static const uint32_t kDx11SharedMagic = 0x31315844; // 'DX11'
 static const uint32_t kDx11SharedVersion = 1;
 // 支持的最大分辨率（用于预留共享内存大小），4K 足够覆盖桌面版窗口。
@@ -51,8 +65,14 @@ struct Dx11CaptureShared {
 //      由同一工作线程执行，保证时序一致。
 // 该结构体布局必须与 script 侧 (Dx11CaptureShared.h::Dx11ClickCommand) 一致。
 // ============================================================================
-static const wchar_t* kClickSharedName       = L"OnmyojiDx11ClickShared";
-static const wchar_t* kClickRequestEventName = L"OnmyojiDx11ClickRequest";
+static const std::wstring& ClickSharedName() {
+    static const std::wstring name = MakePidScopedName(L"OnmyojiDx11ClickShared");
+    return name;
+}
+static const std::wstring& ClickRequestEventName() {
+    static const std::wstring name = MakePidScopedName(L"OnmyojiDx11ClickRequest");
+    return name;
+}
 static const uint32_t kClickMagic   = 0x314B4C43; // 'CLK1'
 static const uint32_t kClickVersion = 2;
 
@@ -127,7 +147,10 @@ static HANDLE g_captureDoneEvent = nullptr; // 手动重置事件
 // 跨进程截图请求事件：script 进程可通过 OpenEvent/SetEvent 直接触发截图，
 // 无需每次都启动 remote_capture_call.exe 进程。DLL 在 hkPresent 中以
 // 非阻塞方式检查此事件，触发后执行截图并写入共享内存。
-static const wchar_t* kCaptureRequestEventName = L"OnmyojiDx11CaptureRequest";
+static const std::wstring& CaptureRequestEventName() {
+    static const std::wstring name = MakePidScopedName(L"OnmyojiDx11CaptureRequest");
+    return name;
+}
 static HANDLE g_crossProcessRequestEvent = nullptr; // auto-reset event
 
 // 跨进程“新帧就绪”事件：SaveTextureToSharedMemory 写完一帧后 SetEvent，
@@ -135,7 +158,10 @@ static HANDLE g_crossProcessRequestEvent = nullptr; // auto-reset event
 // 轮询共享内存序号（每次轮询读 4 字节却要付一次完整的系统调用代价）。
 // auto-reset：script 是唯一等待方，每请求一次消费一次信号；
 // 读端拿到信号后仍按 sequence != prevSeq 二次确认，吃掉旧信号也不会误判。
-static const wchar_t* kCaptureReadyEventName = L"OnmyojiDx11CaptureFrameReady";
+static const std::wstring& CaptureReadyEventName() {
+    static const std::wstring name = MakePidScopedName(L"OnmyojiDx11CaptureFrameReady");
+    return name;
+}
 static HANDLE g_crossProcessReadyEvent = nullptr; // auto-reset event
 
 // 共享内存句柄（在渲染线程首次截图时创建，受 g_deviceCs 保护）
@@ -471,7 +497,7 @@ static bool EnsureSharedMemory() {
 
     g_sharedMapping = CreateFileMappingW(
         INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE,
-        (DWORD)(total >> 32), (DWORD)(total & 0xFFFFFFFF), kDx11SharedName);
+        (DWORD)(total >> 32), (DWORD)(total & 0xFFFFFFFF), CaptureSharedName().c_str());
     if (!g_sharedMapping) {
         Log(L"CreateFileMapping 失败: %lu", GetLastError());
         return false;
@@ -493,7 +519,7 @@ static bool EnsureSharedMemory() {
     hdr->status = 1;
     hdr->width = hdr->height = hdr->channels = hdr->dataSize = 0;
 
-    Log(L"共享内存已创建: %ls (容量=%llu 字节)", kDx11SharedName, (unsigned long long)total);
+    Log(L"共享内存已创建: %ls (容量=%llu 字节)", CaptureSharedName().c_str(), (unsigned long long)total);
     return true;
 }
 
@@ -1281,17 +1307,17 @@ BOOL WINAPI DllMain(HMODULE hModule, DWORD reason, LPVOID) {
         // 创建跨进程截图请求事件（auto-reset），允许 script 进程直接 SetEvent
         // 而无需启动 remote_capture_call.exe 进程。
         if (!g_crossProcessRequestEvent) {
-            g_crossProcessRequestEvent = CreateEventW(nullptr, FALSE, FALSE, kCaptureRequestEventName);
+            g_crossProcessRequestEvent = CreateEventW(nullptr, FALSE, FALSE, CaptureRequestEventName().c_str());
             if (g_crossProcessRequestEvent) {
-                Log(L"跨进程截图请求事件已创建: %ls", kCaptureRequestEventName);
+                Log(L"跨进程截图请求事件已创建: %ls", CaptureRequestEventName().c_str());
             }
         }
         // 创建跨进程“新帧就绪”事件（auto-reset），script 进程等待此事件读取新帧，
         // 替代轮询共享内存序号。旧版 script 进程不打开它，行为不受影响。
         if (!g_crossProcessReadyEvent) {
-            g_crossProcessReadyEvent = CreateEventW(nullptr, FALSE, FALSE, kCaptureReadyEventName);
+            g_crossProcessReadyEvent = CreateEventW(nullptr, FALSE, FALSE, CaptureReadyEventName().c_str());
             if (g_crossProcessReadyEvent) {
-                Log(L"跨进程新帧就绪事件已创建: %ls", kCaptureReadyEventName);
+                Log(L"跨进程新帧就绪事件已创建: %ls", CaptureReadyEventName().c_str());
             }
         }
         g_captureRequested.store(false);
@@ -1304,7 +1330,7 @@ BOOL WINAPI DllMain(HMODULE hModule, DWORD reason, LPVOID) {
         if (!g_clickSharedMapping) {
             g_clickSharedMapping = CreateFileMappingW(
                 INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE,
-                0, sizeof(Dx11ClickCommand), kClickSharedName);
+                0, sizeof(Dx11ClickCommand), ClickSharedName().c_str());
             if (g_clickSharedMapping) {
                 g_clickSharedView = MapViewOfFile(g_clickSharedMapping,
                     FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, sizeof(Dx11ClickCommand));
@@ -1315,14 +1341,14 @@ BOOL WINAPI DllMain(HMODULE hModule, DWORD reason, LPVOID) {
                     cmd->sequence = 0;
                     cmd->doneSeq = 0;
                     cmd->x = cmd->y = 0;
-                    Log(L"点击共享内存已创建: %ls", kClickSharedName);
+                    Log(L"点击共享内存已创建: %ls", ClickSharedName().c_str());
                 }
             }
         }
         if (!g_clickRequestEvent) {
-            g_clickRequestEvent = CreateEventW(nullptr, FALSE, FALSE, kClickRequestEventName);
+            g_clickRequestEvent = CreateEventW(nullptr, FALSE, FALSE, ClickRequestEventName().c_str());
             if (g_clickRequestEvent) {
-                Log(L"点击请求事件已创建: %ls", kClickRequestEventName);
+                Log(L"点击请求事件已创建: %ls", ClickRequestEventName().c_str());
             }
         }
         if (!g_clickThread) {
